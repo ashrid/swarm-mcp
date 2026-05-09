@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swarm-mcp"
+version = "0.1.0"
+description = "Semi-autonomous swarm orchestration MCP server for OpenCode, Claude Code, and Codex"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Rashid" }
+]
+keywords = ["mcp", "swarm", "tmux", "opencode", "claude-code", "codex"]
+dependencies = [
+  "mcp>=1.0.0",
+  "libtmux>=0.55",
+  "pydantic>=2.8",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "mypy>=1.10",
+  "ruff>=0.6",
+  "types-PyYAML>=6.0.12",
+]
+
+[project.scripts]
+swarm-mcp = "swarm_mcp.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["swarm_mcp", "swarm_mcp.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tests"]
+strict = true
