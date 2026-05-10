@@ -11,7 +11,10 @@ from .types import WorkerState
 def parse_iso_timestamp(value: str | None) -> datetime:
     if not value:
         return datetime.now(timezone.utc)
-    return datetime.fromisoformat(value)
+    try:
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return datetime.now(timezone.utc)
 
 
 def latest_activity_iso(status_updated_at: str, progress_payload: dict[str, Any] | None) -> str:

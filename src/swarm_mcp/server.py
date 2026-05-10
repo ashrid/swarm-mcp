@@ -16,10 +16,12 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from .archive import ArchiveManager
 from .config import SwarmConfig
+from .cost_parser import parse_provider_output
 from .health import compute_staleness_transition, latest_activity_iso
 from .logging import configure_logging
 from .message_queue import MessageQueue
-from .planner import decompose_task, normalize_task, task_similarity
+from .permission_parser import process_permission_batch, scan_for_permission_requests
+from .planner import SemanticDeduplicator, decompose_task, normalize_task
 from .provider_router import ProviderRouter
 from .registry import WorkerRegistry
 from .reporting import ReportingService
@@ -41,6 +43,17 @@ from .workspace import WorkspaceManager
 logger = configure_logging()
 
 
+def _validate_agent_id(agent_id: Any) -> None:
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        raise ValueError("agent_id must be a non-empty string")
+    if len(agent_id) > 80:
+        raise ValueError("agent_id must be at most 80 characters")
+    if "/" in agent_id or "\\" in agent_id or ".." in agent_id:
+        raise ValueError("agent_id contains invalid characters")
+    if any(ord(c) < 32 for c in agent_id):
+        raise ValueError("agent_id contains control characters")
+
+
 def _result_path(app: AppContext, agent_id: str) -> Path:
     return app.workspace.result_file(agent_id)
 
@@ -53,7 +66,20 @@ def _read_progress_payload(app: AppContext, agent_id: str) -> dict[str, Any] | N
     progress_path = app.workspace.progress_file(agent_id)
     if not progress_path.exists():
         return None
-    payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _load_result_payload(result_path: Path) -> dict[str, Any] | None:
+    if not result_path.exists():
+        return None
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
     return payload if isinstance(payload, dict) else None
 
 
@@ -91,6 +117,19 @@ async def _record_worker_cost(
     input_tokens: int = 0,
     output_tokens: int = 0,
 ) -> dict[str, Any]:
+    import math
+
+    if (
+        type(amount) not in (int, float)
+        or isinstance(amount, bool)
+        or not math.isfinite(amount)
+        or amount < 0
+    ):
+        raise ValueError("amount must be a finite non-negative number")
+    if type(input_tokens) is not int or isinstance(input_tokens, bool) or input_tokens < 0:
+        raise ValueError("input_tokens must be a non-negative integer")
+    if type(output_tokens) is not int or isinstance(output_tokens, bool) or output_tokens < 0:
+        raise ValueError("output_tokens must be a non-negative integer")
     record = await app.registry.get(agent_id)
     entry = CostEntry(
         agent_id=agent_id,
@@ -107,8 +146,9 @@ async def _record_worker_cost(
     )
     budget_limit = record.task.budget_limit if record.task else None
     exceeded = budget_limit is not None and updated_status.budget_spent >= budget_limit
-    if exceeded and app.tmux.is_alive(agent_id):
-        app.tmux.kill_worker(agent_id)
+    if exceeded:
+        if app.tmux.is_alive(agent_id):
+            app.tmux.kill_worker(agent_id)
         await app.registry.update_status(agent_id, state=WorkerState.FAILED)
         app.history.log_event(
             "swarm_budget_exceeded",
@@ -117,6 +157,20 @@ async def _record_worker_cost(
                 "budget_spent": updated_status.budget_spent,
                 "budget_limit": budget_limit,
             },
+        )
+        await _dispatch_queue_for_provider(app, record.status.provider)
+        result_path = app.workspace.result_file(agent_id)
+        result_path.write_text(
+            json.dumps(
+                {
+                    "agent_id": agent_id,
+                    "output": "Budget exceeded",
+                    "exit_code": 1,
+                    "failure_class": FailureClass.BUDGET_EXCEEDED.value,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
         )
     return {
         "agent_id": agent_id,
@@ -130,13 +184,24 @@ async def _process_result_file(app: AppContext, agent_id: str) -> dict[str, Any]
     result_path = app.workspace.result_file(agent_id)
     if not result_path.exists():
         return None
-    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
     if not isinstance(payload, dict):
         return None
-    record = await app.registry.get(agent_id)
-    exit_code_raw = payload.get("exit_code")
-    if not isinstance(exit_code_raw, int):
+    try:
+        record = await app.registry.get(agent_id)
+    except KeyError:
         payload["failure_class"] = FailureClass.UNKNOWN.value
+        payload["state"] = WorkerState.FAILED.value
+        result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return payload
+    exit_code_raw = payload.get("exit_code")
+    if type(exit_code_raw) is not int:
+        payload["failure_class"] = FailureClass.UNKNOWN.value
+        payload["exit_code"] = 1
+        result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         await app.registry.update_status(agent_id, state=WorkerState.FAILED)
         app.history.log_event(
             "swarm_failed",
@@ -146,13 +211,84 @@ async def _process_result_file(app: AppContext, agent_id: str) -> dict[str, Any]
         return payload
     exit_code = exit_code_raw
     output_text = str(payload.get("output", ""))
+
+    cost_info = parse_provider_output(output_text)
+    has_input = cost_info.get("input_tokens") is not None
+    has_output = cost_info.get("output_tokens") is not None
+    has_cost = cost_info.get("estimated_cost") is not None
+    if not payload.get("parsed_cost") and (has_input or has_output or has_cost):
+        input_tokens = cost_info.get("input_tokens") or 0
+        output_tokens = cost_info.get("output_tokens") or 0
+        estimated_cost = cost_info.get("estimated_cost")
+        if estimated_cost is None and (input_tokens > 0 or output_tokens > 0):
+            provider_config = app.config.providers.get(record.status.provider)
+            if provider_config and (
+                provider_config.cost_per_1k_input > 0 or provider_config.cost_per_1k_output > 0
+            ):
+                input_cost = input_tokens * provider_config.cost_per_1k_input / 1000
+                output_cost = output_tokens * provider_config.cost_per_1k_output / 1000
+                estimated_cost = round(input_cost + output_cost, 6)
+            else:
+                estimated_cost = round((input_tokens + output_tokens) * 0.000002, 6)
+        if estimated_cost is None:
+            estimated_cost = 0.0
+        await _record_worker_cost(
+            app,
+            agent_id=agent_id,
+            amount=estimated_cost,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+        payload["parsed_cost"] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "estimated_cost": estimated_cost,
+        }
+        result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    permission_requests = scan_for_permission_requests(
+        output_text, custom_patterns=app.config.permission_monitor.denial_patterns
+    )
+    if permission_requests:
+        await _scan_output_for_permissions(app, agent_id, output_text)
+
     if exit_code == 0:
-        await app.registry.update_status(agent_id, state=WorkerState.DONE)
-        app.history.log_event("swarm_complete", {"agent_id": agent_id, "exit_code": exit_code})
-        await _dispatch_queue_for_provider(app, record.status.provider)
+        updated_record = await app.registry.get(agent_id)
+        budget_limit = updated_record.task.budget_limit if updated_record.task else None
+        budget_spent = updated_record.status.budget_spent
+        budget_exceeded = budget_limit is not None and budget_spent >= budget_limit
+        if budget_exceeded:
+            payload["failure_class"] = FailureClass.BUDGET_EXCEEDED.value
+            payload["exit_code"] = 1
+            result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            await app.registry.update_status(agent_id, state=WorkerState.FAILED)
+            app.history.log_event(
+                "swarm_budget_exceeded",
+                {
+                    "agent_id": agent_id,
+                    "budget_spent": budget_spent,
+                    "budget_limit": budget_limit,
+                },
+            )
+        else:
+            payload["failure_class"] = None
+            payload["exit_code"] = exit_code
+            result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            await app.registry.update_status(agent_id, state=WorkerState.DONE)
+            app.history.log_event("swarm_complete", {"agent_id": agent_id, "exit_code": exit_code})
+        await _dispatch_queue_for_provider(app, updated_record.status.provider)
     else:
         failure = _classify_failure(record.status, output_text)
+        if failure == FailureClass.UNKNOWN:
+            disk_payload = _load_result_payload(result_path)
+            disk_failure = disk_payload.get("failure_class") if disk_payload else None
+            if disk_failure == FailureClass.BUDGET_EXCEEDED.value:
+                failure = FailureClass.BUDGET_EXCEEDED
         payload["failure_class"] = failure.value
+        payload["exit_code"] = exit_code
+        result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        if failure == FailureClass.PERMISSION_DENIED:
+            await _scan_output_for_permissions(app, agent_id, output_text)
         await app.registry.update_status(agent_id, state=WorkerState.FAILED)
         app.history.log_event(
             "swarm_failed",
@@ -160,6 +296,13 @@ async def _process_result_file(app: AppContext, agent_id: str) -> dict[str, Any]
         )
         await _dispatch_queue_for_provider(app, record.status.provider)
     return payload
+
+
+def _provider_budget_exceeded(app: AppContext, provider: ProviderKind) -> bool:
+    costs_summary = app.costs.summary()
+    provider_cost_used = float(costs_summary.get("by_provider", {}).get(provider.value, 0.0))
+    provider_cost_cap = app.config.budgets.max_cost_per_provider.get(provider.value)
+    return provider_cost_cap is not None and provider_cost_used >= provider_cost_cap
 
 
 async def _dispatch_queue_for_provider(
@@ -173,7 +316,37 @@ async def _dispatch_queue_for_provider(
             continue
         if provider_filter and record.status.provider != provider_filter:
             continue
-        provider_config = app.config.providers[record.status.provider]
+        if _provider_budget_exceeded(app, record.status.provider):
+            await app.registry.update_status(
+                record.status.agent_id,
+                state=WorkerState.FAILED,
+                failure_reason="provider_budget_exceeded",
+            )
+            app.history.log_event(
+                "swarm_provider_budget_exceeded",
+                {
+                    "agent_id": record.status.agent_id,
+                    "provider": record.status.provider.value,
+                },
+            )
+            result_path = app.workspace.result_file(record.status.agent_id)
+            if not result_path.exists():
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "agent_id": record.status.agent_id,
+                            "output": "Provider budget exceeded",
+                            "exit_code": 1,
+                            "failure_class": FailureClass.BUDGET_EXCEEDED.value,
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            continue
+        provider_config = app.config.providers.get(record.status.provider)
+        if provider_config is None:
+            continue
         current = await app.registry.list()
         active = [
             item
@@ -188,17 +361,26 @@ async def _dispatch_queue_for_provider(
     return launched
 
 
+def _parse_pid(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def _startup_main_lock_status(app: AppContext) -> tuple[str, dict[str, object] | None]:
     existing = app.workspace.read_main_lock()
     current_pid = os.getpid()
     if not existing:
         app.workspace.write_main_lock(pid=current_pid)
         return ("claimed", None)
-    existing_pid = existing.get("pid")
-    if isinstance(existing_pid, (int, str)) and int(existing_pid) == current_pid:
+    existing_pid = _parse_pid(existing.get("pid"))
+    if existing_pid is None:
         app.workspace.write_main_lock(pid=current_pid)
         return ("claimed", existing)
-    if isinstance(existing_pid, (int, str)) and not _pid_is_alive(int(existing_pid)):
+    if existing_pid == current_pid:
+        app.workspace.write_main_lock(pid=current_pid)
+        return ("claimed", existing)
+    if not _pid_is_alive(existing_pid):
         app.workspace.write_main_lock(pid=current_pid)
         return ("claimed", existing)
     return ("conflict", existing)
@@ -208,8 +390,8 @@ def _claim_main_lock(app: AppContext, force: bool) -> dict[str, Any]:
     existing = app.workspace.read_main_lock()
     current_pid = os.getpid()
     if existing and not force:
-        existing_pid = existing.get("pid")
-        if isinstance(existing_pid, (int, str)) and int(existing_pid) != current_pid:
+        existing_pid = _parse_pid(existing.get("pid"))
+        if existing_pid is not None and existing_pid != current_pid:
             return {
                 "status": "conflict",
                 "message": "main lock already held for this workspace",
@@ -247,6 +429,84 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+async def _scan_output_for_permissions(
+    app: AppContext, agent_id: str, output_text: str
+) -> bool:
+    custom_patterns = app.config.permission_monitor.denial_patterns
+    requests = scan_for_permission_requests(output_text, custom_patterns=custom_patterns)
+    if not requests:
+        return False
+    permissions_path = app.workspace.permissions_file(agent_id)
+    current = app.workspace.read_json(permissions_path, {"requests": [], "approved_paths": []})
+    if not isinstance(current, dict):
+        current = {"requests": [], "approved_paths": []}
+    raw_approved: Any = current.get("approved_paths", [])
+    approved_paths: list[str] = (
+        [p for p in raw_approved if isinstance(p, str)]
+        if isinstance(raw_approved, list)
+        else []
+    )
+    requests_list: list[Any] = current.get("requests", [])
+    if not isinstance(requests_list, list):
+        requests_list = []
+    preserved_keys: dict[str, Any] = {
+        k: v for k, v in current.items() if k not in ("requests", "approved_paths")
+    }
+    existing_paths = {
+        str(req.get("path", ""))
+        for req in requests_list
+        if isinstance(req, dict)
+    }
+    new_requests = [r for r in requests if r["path"] not in existing_paths]
+    if not new_requests:
+        return False
+    results = process_permission_batch(new_requests, str(app.workspace.root))
+    any_denied = False
+    for result in results:
+        entry = {"path": result["path"], "reason": result["reason"], "status": result["status"]}
+        requests_list.append(entry)
+        if result["status"] == "denied":
+            any_denied = True
+            app.history.log_event(
+                "swarm_permission_auto_denied",
+                {"agent_id": agent_id, "path": result["path"], "reason": result["reason"]},
+            )
+    app.workspace.write_json(
+        permissions_path,
+        {"requests": requests_list, "approved_paths": approved_paths, **preserved_keys},
+    )
+    return any_denied
+
+
+async def _scan_and_auto_deny_permissions(app: AppContext, agent_id: str) -> None:
+    if not app.tmux.is_alive(agent_id):
+        return
+    output = app.tmux.capture_pane(agent_id)
+    denied = await _scan_output_for_permissions(app, agent_id, output)
+    if denied and app.tmux.is_alive(agent_id):
+        app.tmux.kill_worker(agent_id)
+        await app.registry.update_status(agent_id, state=WorkerState.FAILED)
+        result_path = app.workspace.result_file(agent_id)
+        if not result_path.exists():
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "agent_id": agent_id,
+                        "output": "Permission auto-denied",
+                        "exit_code": 1,
+                        "failure_class": FailureClass.PERMISSION_DENIED.value,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        try:
+            record = await app.registry.get(agent_id)
+            await _dispatch_queue_for_provider(app, record.status.provider)
+        except KeyError:
+            pass
+
+
 async def _health_monitor(app: AppContext) -> None:
     while True:
         records = await app.registry.list()
@@ -254,6 +514,7 @@ async def _health_monitor(app: AppContext) -> None:
         for record in records:
             if record.status.state not in {WorkerState.RUNNING, WorkerState.STALE}:
                 continue
+            await _scan_and_auto_deny_permissions(app, record.status.agent_id)
             progress_payload = _read_progress_payload(app, record.status.agent_id)
             latest_iso = latest_activity_iso(record.status.updated_at, progress_payload)
             result_exists = app.workspace.result_file(record.status.agent_id).exists()
@@ -288,6 +549,20 @@ async def _health_monitor(app: AppContext) -> None:
             if transition == WorkerState.FAILED:
                 if app.tmux.is_alive(record.status.agent_id):
                     app.tmux.kill_worker(record.status.agent_id)
+                result_path = app.workspace.result_file(record.status.agent_id)
+                if not result_path.exists():
+                    result_path.write_text(
+                        json.dumps(
+                            {
+                                "agent_id": record.status.agent_id,
+                                "output": "Worker killed: stale timeout",
+                                "exit_code": 1,
+                                "failure_class": FailureClass.TIMEOUT.value,
+                            },
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
                 await app.registry.update_status(record.status.agent_id, state=WorkerState.FAILED)
                 app.history.log_event(
                     "swarm_failed",
@@ -298,6 +573,11 @@ async def _health_monitor(app: AppContext) -> None:
 
 
 async def _launch_worker(app: AppContext, worker_task: WorkerTask) -> dict[str, Any]:
+    try:
+        await app.registry.get(worker_task.agent_id)
+        raise ValueError(f"agent_id {worker_task.agent_id} already exists")
+    except KeyError:
+        pass
     render_info = app.renderer.render_all(worker_task)
     runtime_prompt = app.renderer.render_runtime_prompt(worker_task)
     opencode_runtime_config = json.dumps(
@@ -500,6 +780,7 @@ async def swarm_spawn(
     allow_duplicate: bool = False,
 ) -> dict[str, Any]:
     """Spawn a worker with generated configs and a provider-specific command."""
+    _validate_agent_id(agent_id)
     app: AppContext = ctx.request_context.lifespan_context
     _require_orchestration_enabled(app)
     provider_kind = ProviderKind(provider)
@@ -523,6 +804,15 @@ async def swarm_spawn(
         if record.status.provider == provider_kind and record.status.state == WorkerState.RUNNING
     ]
     active_states = {WorkerState.PENDING, WorkerState.RUNNING, WorkerState.STALE}
+    active_tasks = [
+        record.task.prompt
+        for record in existing
+        if record.task is not None and record.status.state in active_states
+    ]
+
+    deduplicator = SemanticDeduplicator(similarity_threshold=0.75)
+    best_similarity, best_match = deduplicator.find_best_match(task, active_tasks)
+
     for record in existing:
         if record.task is None:
             continue
@@ -535,15 +825,27 @@ async def swarm_spawn(
                 "existing_agent_id": record.status.agent_id,
                 "existing_task_id": record.task.task_id,
             }
-        similarity = task_similarity(record.task.prompt, task)
-        if not allow_duplicate and similarity >= 0.8:
+        if not allow_duplicate and record.task.prompt == best_match and best_similarity >= 0.75:
             return {
                 "status": "similar_task",
                 "message": f"Task is highly similar to {record.status.agent_id}",
                 "existing_agent_id": record.status.agent_id,
                 "existing_task_id": record.task.task_id,
-                "similarity": similarity,
+                "similarity": best_similarity,
             }
+    try:
+        await app.registry.get(agent_id)
+        return {
+            "status": "duplicate_agent_id",
+            "message": f"agent_id {agent_id} already exists",
+        }
+    except KeyError:
+        pass
+    if budget_limit is not None:
+        import math
+
+        if not math.isfinite(budget_limit) or budget_limit < 0:
+            raise ValueError("budget_limit must be a non-negative finite number")
     worker_task = WorkerTask(
         agent_id=agent_id,
         provider=provider_kind,
@@ -557,7 +859,11 @@ async def swarm_spawn(
         mcp_servers=mcp_servers or ["swarm", "octopoda"],
         priority=Priority(priority),
         preemptible=preemptible,
-        budget_limit=budget_limit or app.config.budgets.default_task_budget,
+        budget_limit=(
+            budget_limit
+            if budget_limit is not None and budget_limit >= 0
+            else app.config.budgets.default_task_budget
+        ),
         max_lifetime_seconds=max_lifetime,
     )
     if len(active_for_provider) >= provider_config.max_workers:
@@ -638,7 +944,37 @@ async def swarm_dispatch_queue(
             continue
         if provider_filter and record.status.provider != provider_filter:
             continue
-        provider_config = app.config.providers[record.status.provider]
+        if _provider_budget_exceeded(app, record.status.provider):
+            await app.registry.update_status(
+                record.status.agent_id,
+                state=WorkerState.FAILED,
+                failure_reason="provider_budget_exceeded",
+            )
+            app.history.log_event(
+                "swarm_provider_budget_exceeded",
+                {
+                    "agent_id": record.status.agent_id,
+                    "provider": record.status.provider.value,
+                },
+            )
+            result_path = app.workspace.result_file(record.status.agent_id)
+            if not result_path.exists():
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "agent_id": record.status.agent_id,
+                            "output": "Provider budget exceeded",
+                            "exit_code": 1,
+                            "failure_class": FailureClass.BUDGET_EXCEEDED.value,
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            continue
+        provider_config = app.config.providers.get(record.status.provider)
+        if provider_config is None:
+            continue
         current = await app.registry.list()
         active = [
             item
@@ -660,6 +996,8 @@ async def swarm_status(
     agent_id: str | None = None,
 ) -> dict[str, Any]:
     """Return current worker status for one worker or all workers."""
+    if agent_id:
+        _validate_agent_id(agent_id)
     app: AppContext = ctx.request_context.lifespan_context
     if agent_id:
         record = await app.registry.get(agent_id)
@@ -691,6 +1029,7 @@ async def swarm_send(
     priority: str = "normal",
 ) -> dict[str, Any]:
     """Write a worker message to disk and inject it into the tmux pane."""
+    _validate_agent_id(agent_id)
     app: AppContext = ctx.request_context.lifespan_context
     _require_orchestration_enabled(app)
     await app.registry.get(agent_id)
@@ -709,6 +1048,8 @@ async def swarm_results(
     agent_id: str | None = None,
 ) -> dict[str, Any]:
     """Replay persisted results from disk."""
+    if agent_id:
+        _validate_agent_id(agent_id)
     app: AppContext = ctx.request_context.lifespan_context
     if agent_id:
         path = app.workspace.result_file(agent_id)
@@ -732,6 +1073,7 @@ async def swarm_collect(
     timeout: int = 300,
 ) -> dict[str, Any]:
     """Collect a worker result from queue or persisted file."""
+    _validate_agent_id(agent_id)
     app: AppContext = ctx.request_context.lifespan_context
     record = await app.registry.get(agent_id)
     result_path = app.workspace.result_file(agent_id)
@@ -748,9 +1090,9 @@ async def swarm_collect(
         }
     payload = result.model_dump(mode="json")
     _write_result_file(app, payload, agent_id)
-    await _process_result_file(app, agent_id)
+    processed = await _process_result_file(app, agent_id)
     app.history.log_event("swarm_collect", {"agent_id": agent_id})
-    return {"status": "ok", "result": payload}
+    return {"status": "ok", "result": processed if processed is not None else payload}
 
 
 async def _wait_for_workers(
@@ -759,6 +1101,8 @@ async def _wait_for_workers(
     timeout: int,
     mode: str,
 ) -> dict[str, Any]:
+    for agent_id in agent_ids:
+        _validate_agent_id(agent_id)
     started = asyncio.get_event_loop().time()
     collected: list[dict[str, Any]] = []
     pending = set(agent_ids)
@@ -811,6 +1155,7 @@ async def swarm_retry(
     smart_retry: bool = False,
 ) -> dict[str, Any]:
     """Retry a worker using the original task and optional provider override."""
+    _validate_agent_id(agent_id)
     app: AppContext = ctx.request_context.lifespan_context
     _require_orchestration_enabled(app)
     record = await app.registry.get(agent_id)
@@ -819,12 +1164,15 @@ async def swarm_retry(
     output_text = ""
     result_path = app.workspace.result_file(agent_id)
     if result_path.exists():
-        result_payload = json.loads(result_path.read_text(encoding="utf-8"))
-        output_text = (
-            str(result_payload.get("output", ""))
-            if isinstance(result_payload, dict)
-            else ""
-        )
+        try:
+            result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+            output_text = (
+                str(result_payload.get("output", ""))
+                if isinstance(result_payload, dict)
+                else ""
+            )
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            output_text = ""
     elif app.tmux.is_alive(agent_id):
         output_text = app.tmux.capture_pane(agent_id)
     failure = _classify_failure(record.status, output_text)
@@ -855,6 +1203,7 @@ async def swarm_retry(
         priority=record.task.priority.value,
         preemptible=record.task.preemptible,
         max_lifetime=record.task.max_lifetime_seconds,
+        budget_limit=record.task.budget_limit,
         allow_duplicate=True,
     )
     app.history.log_event(
@@ -883,24 +1232,51 @@ async def swarm_ask_permission(
     action: str | None = None,
 ) -> dict[str, Any]:
     """Request or resolve a permission escalation for a worker."""
+    _validate_agent_id(agent_id)
     app: AppContext = ctx.request_context.lifespan_context
     permissions_path = app.workspace.permissions_file(agent_id)
     current = app.workspace.read_json(permissions_path, {"requests": [], "approved_paths": []})
     if not isinstance(current, dict):
         current = {"requests": [], "approved_paths": []}
-    requests = cast(list[dict[str, str]], current.setdefault("requests", []))
-    approved_paths = cast(list[str], current.setdefault("approved_paths", []))
+    raw_requests: Any = current.get("requests", [])
+    requests: list[dict[str, Any]] = (
+        [
+            req
+            for req in raw_requests
+            if isinstance(req, dict) and isinstance(req.get("path"), str)
+        ]
+        if isinstance(raw_requests, list)
+        else []
+    )
+    raw_approved: Any = current.get("approved_paths", [])
+    approved_paths: list[str] = (
+        [p for p in raw_approved if isinstance(p, str)]
+        if isinstance(raw_approved, list)
+        else []
+    )
+    preserved_keys: dict[str, Any] = {
+        k: v for k, v in current.items() if k not in ("requests", "approved_paths")
+    }
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("path must be a non-empty string")
+    path = path.strip()
     if action is None:
         request = {"path": path, "reason": reason, "status": "pending"}
         requests.append(request)
-        app.workspace.write_json(permissions_path, current)
+        app.workspace.write_json(
+            permissions_path,
+            {"requests": requests, "approved_paths": approved_paths, **preserved_keys},
+        )
         return {"status": "pending", "request": request}
     if action not in {"allow", "deny"}:
         raise ValueError("action must be allow or deny")
     if action == "allow":
         approved_paths.append(path)
     requests.append({"path": path, "reason": reason, "status": action})
-    app.workspace.write_json(permissions_path, current)
+    app.workspace.write_json(
+        permissions_path,
+        {"requests": requests, "approved_paths": approved_paths, **preserved_keys},
+    )
     app.history.log_event(
         "swarm_permission",
         {"agent_id": agent_id, "path": path, "reason": reason, "status": action},
@@ -916,6 +1292,7 @@ async def swarm_request_peer(
     provider: str | None = None,
 ) -> dict[str, Any]:
     """Allow a worker to request a peer helper at depth=1."""
+    _validate_agent_id(agent_id)
     app: AppContext = ctx.request_context.lifespan_context
     record = await app.registry.get(agent_id)
     if record.task is None:
@@ -1086,6 +1463,7 @@ async def swarm_progress(
     percent: float,
 ) -> dict[str, Any]:
     """Update worker progress and refresh its staleness clock."""
+    _validate_agent_id(agent_id)
     app: AppContext = ctx.request_context.lifespan_context
     progress = {
         "agent_id": agent_id,
@@ -1115,6 +1493,7 @@ async def swarm_record_cost(
     output_tokens: int = 0,
 ) -> dict[str, Any]:
     """Record worker cost and enforce per-task budget limits."""
+    _validate_agent_id(agent_id)
     app: AppContext = ctx.request_context.lifespan_context
     result = await _record_worker_cost(
         app,
@@ -1192,8 +1571,32 @@ async def swarm_dashboard(ctx: Context[Any, AppContext]) -> dict[str, Any]:
 
 
 @mcp.tool()
+async def swarm_dashboard_pane(
+    ctx: Context[Any, AppContext],
+    refresh_interval: int = 5,
+) -> dict[str, Any]:
+    app: AppContext = ctx.request_context.lifespan_context
+    _require_orchestration_enabled(app)
+    pane_id = app.tmux.spawn_dashboard(
+        str(app.workspace.swarm_dir),
+        refresh_interval=refresh_interval,
+    )
+    app.history.log_event(
+        "swarm_dashboard_pane",
+        {"pane_id": pane_id, "refresh_interval": refresh_interval},
+    )
+    return {
+        "status": "ok",
+        "pane_id": pane_id,
+        "refresh_interval": refresh_interval,
+        "message": f"Dashboard pane spawned with {refresh_interval}s refresh",
+    }
+
+
+@mcp.tool()
 async def swarm_undo(ctx: Context[Any, AppContext], agent_id: str) -> dict[str, Any]:
     """Return the stored pre-execution snapshot for a worker."""
+    _validate_agent_id(agent_id)
     app: AppContext = ctx.request_context.lifespan_context
     snapshot = app.snapshots.read(agent_id)
     if snapshot is None:
@@ -1244,6 +1647,7 @@ async def swarm_cleanup(
 @mcp.tool()
 async def swarm_terminate(ctx: Context[Any, AppContext], agent_id: str) -> dict[str, Any]:
     """Terminate a worker and mark its registry entry failed or removed."""
+    _validate_agent_id(agent_id)
     app: AppContext = ctx.request_context.lifespan_context
     _require_orchestration_enabled(app)
     record = await app.registry.get(agent_id)

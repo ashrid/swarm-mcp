@@ -36,9 +36,18 @@ class HistoryTracker:
     def read_timeline(self) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         for path in sorted((self.workspace.swarm_dir / "history").glob("*/timeline.jsonl")):
-            for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for line in text.splitlines():
                 if line.strip():
-                    entries.append(json.loads(line))
+                    try:
+                        item = json.loads(line)
+                        if isinstance(item, dict):
+                            entries.append(item)
+                    except json.JSONDecodeError:
+                        continue
         return entries
 
 
@@ -66,7 +75,11 @@ class SnapshotManager:
         path = self.workspace.snapshot_file(agent_id)
         if not path.exists():
             return None
-        return Snapshot.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return Snapshot.model_validate(data)
+        except (json.JSONDecodeError, OSError, Exception):
+            return None
 
 
 @dataclass
@@ -80,15 +93,34 @@ class CostTracker:
         payload = self.workspace.read_json(self._costs_path(), {"entries": []})
         if not isinstance(payload, dict):
             payload = {"entries": []}
-        entries: list[dict[str, Any]] = payload.setdefault("entries", [])
+        raw_entries: Any = payload.get("entries", [])
+        entries: list[dict[str, Any]] = raw_entries if isinstance(raw_entries, list) else []
         entries.append(entry.model_dump(mode="json"))
-        self.workspace.write_json(self._costs_path(), payload)
+        self.workspace.write_json(self._costs_path(), {"entries": entries})
 
     def summary(self) -> dict[str, Any]:
+        import math
+
         payload = self.workspace.read_json(self._costs_path(), {"entries": []})
         if not isinstance(payload, dict):
             payload = {"entries": []}
-        entries = [CostEntry.model_validate(item) for item in payload.get("entries", [])]
+        raw_entries: list[Any] = payload.get("entries", [])
+        if not isinstance(raw_entries, list):
+            raw_entries = []
+        entries: list[CostEntry] = []
+        for item in raw_entries:
+            try:
+                if isinstance(item, dict) and (
+                    isinstance(item.get("estimated_cost"), bool)
+                    or isinstance(item.get("input_tokens"), bool)
+                    or isinstance(item.get("output_tokens"), bool)
+                ):
+                    continue
+                entry = CostEntry.model_validate(item)
+                if math.isfinite(entry.estimated_cost) and entry.estimated_cost >= 0:
+                    entries.append(entry)
+            except Exception:
+                continue
         total_cost = sum(entry.estimated_cost for entry in entries)
         by_provider: dict[str, float] = {}
         for entry in entries:

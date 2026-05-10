@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from swarm_mcp.planner import (
+    SemanticDeduplicator,
     classify_task_category,
     decompose_task,
     normalize_task,
@@ -34,3 +35,49 @@ def test_task_similarity_detects_rephrased_duplicates() -> None:
         "analyze the auth module vulnerabilities",
     )
     assert similarity >= 0.8
+
+
+def test_semantic_deduplicator_finds_similar_tasks() -> None:
+    dedup = SemanticDeduplicator(similarity_threshold=0.75)
+    existing = [
+        "refactor payment service code",
+        "implement user profile page",
+        "audit authentication module",
+    ]
+    similarity, match = dedup.find_best_match("cleanup payment service implementation", existing)
+    assert 0.3 <= similarity < 0.75
+    assert match == "refactor payment service code"
+
+
+def test_semantic_deduplicator_returns_low_for_dissimilar() -> None:
+    dedup = SemanticDeduplicator(similarity_threshold=0.75)
+    existing = ["refactor payment service", "implement login page"]
+    similarity, match = dedup.find_best_match("deploy to production server", existing)
+    assert similarity < 0.4
+    assert match is not None
+
+
+def test_semantic_deduplicator_exact_match() -> None:
+    dedup = SemanticDeduplicator(similarity_threshold=0.75)
+    existing = ["fix the login bug", "update dependencies"]
+    similarity, match = dedup.find_best_match("fix the login bug", existing)
+    assert similarity > 0.99
+    assert match == "fix the login bug"
+
+
+def test_semantic_deduplicator_empty_corpus() -> None:
+    dedup = SemanticDeduplicator(similarity_threshold=0.75)
+    similarity, match = dedup.find_best_match("some task", [])
+    assert similarity == 0.0
+    assert match is None
+
+
+def test_semantic_deduplicator_similarity_method() -> None:
+    dedup = SemanticDeduplicator(similarity_threshold=0.75)
+    existing = [
+        "refactor payment service code",
+        "implement user profile page",
+    ]
+    dedup.update_corpus(existing + ["cleanup payment service implementation"])
+    sim = dedup.similarity("cleanup payment service implementation", existing[0])
+    assert 0.3 <= sim < 0.75

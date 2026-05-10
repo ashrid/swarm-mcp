@@ -29,7 +29,8 @@ class ReportingService:
 
         for event in events:
             event_type = event.get("event")
-            payload = event.get("payload", {})
+            raw_payload = event.get("payload", {})
+            payload = raw_payload if isinstance(raw_payload, dict) else {}
             if event_type == "swarm_spawn":
                 agent_id = payload.get("agent_id")
                 if isinstance(agent_id, str):

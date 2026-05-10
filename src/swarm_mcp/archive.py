@@ -19,15 +19,29 @@ class ArchiveManager:
     def _results(self) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         for path in sorted((self.workspace.swarm_dir / "results").glob("*.json")):
-            results.append(json.loads(path.read_text(encoding="utf-8")))
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    results.append(data)
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                continue
         return results
 
     def _history(self) -> list[dict[str, Any]]:
         history: list[dict[str, Any]] = []
         for path in sorted((self.workspace.swarm_dir / "history").glob("*/timeline.jsonl")):
-            for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for line in text.splitlines():
                 if line.strip():
-                    history.append(json.loads(line))
+                    try:
+                        data = json.loads(line)
+                        if isinstance(data, dict):
+                            history.append(data)
+                    except json.JSONDecodeError:
+                        continue
         return history
 
     def build_session_markdown(self) -> str:

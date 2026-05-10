@@ -31,9 +31,21 @@ class WorkerRegistry:
             workers = payload.get("workers", []) if isinstance(payload, dict) else []
             self._records = {}
             for item in workers:
-                status = WorkerStatus.model_validate(item["status"])
+                if not isinstance(item, dict) or not isinstance(item.get("status"), dict):
+                    continue
+                try:
+                    status = WorkerStatus.model_validate(item["status"])
+                except Exception:
+                    continue
                 task_data = item.get("task")
-                task = WorkerTask.model_validate(task_data) if task_data else None
+                if task_data is not None and not isinstance(task_data, dict):
+                    continue
+                task = None
+                if isinstance(task_data, dict):
+                    try:
+                        task = WorkerTask.model_validate(task_data)
+                    except Exception:
+                        continue
                 self._records[status.agent_id] = RegistryRecord(status=status, task=task)
             self._loaded = True
 

@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.11+-blue)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-30%2F30-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-69%2F69-brightgreen)](tests/)
 [![Type Check](https://img.shields.io/badge/mypy-strict-brightgreen)](https://mypy-lang.org)
 [![Lint](https://img.shields.io/badge/ruff-clean-brightgreen)](https://docs.astral.sh/ruff)
 
@@ -32,7 +32,7 @@ Swarm MCP is an MCP (Model Context Protocol) server that turns your AI CLI into 
 
 ### Key features
 
-- **28 MCP tools** — spawn, monitor, wait, retry, collect, broadcast, decompose, archive, rollback
+- **33 MCP tools** — spawn, monitor, wait, retry, collect, broadcast, decompose, archive, rollback
 - **Multi-provider** — workers can run on different AI CLIs and models simultaneously
 - **Semi-autonomous** — the server handles routine ops; you handle strategy and exceptions
 - **Cost tracking** — per-task budgets, provider caps, running cost totals
@@ -86,7 +86,7 @@ This installs:
 ### Step 3 — Verify
 
 ```bash
-python3 -m pytest tests -q       # 30 tests, all passing
+python3 -m pytest tests -q       # 69 tests, all passing
 python3 -m mypy src              # zero type errors
 python3 -m ruff check src        # zero lint issues
 timeout 3s python3 -m swarm_mcp  # server boots successfully
@@ -194,12 +194,10 @@ swarm_spawn(
     task="refactor payment service",
     model="auto",                    # model="auto" picks the best model based on history
     skills=["gsd-debug"],            # load specific skills
-    budget_limit=2.0,                # auto-terminate if cost exceeds $2
-    priority="critical",             # jump the queue
-    preemptible=False,               # cannot be preempted by higher-priority tasks
-    max_duration=600,                # auto-terminate after 10 minutes
-    chain="worker-5",                # auto-spawn worker-5 after this one completes
-    allow_peer_request=True          # allow this worker to request helper workers
+    budget_limit=2.0,                # main-side enforcement when cost reaches or exceeds $2
+    priority="critical",             # stored for reference (queue ordering not yet implemented)
+    preemptible=False,               # stored for reference (preemption not yet implemented)
+    max_lifetime=600,                # stored for retry/reference (not yet enforced)
 )
 ```
 
@@ -237,7 +235,7 @@ swarm_cleanup(force=True)    # archive session to markdown + purge transient fil
 | `swarm_spawn(agent_id, provider, task, ...)` | Create a worker in a tmux pane |
 | `swarm_terminate(agent_id)` | Kill a worker and cleanup |
 | `swarm_retry(agent_id, ...)` | Re-spawn with smart failure analysis |
-| `swarm_broadcast(task, provider, count)` | Fan-out the same task to N workers |
+| `swarm_broadcast(task, providers=None)` | Fan-out the same task to N workers |
 | `swarm_shutdown(graceful=True)` | Graceful or immediate shutdown |
 
 ### Communication
@@ -252,8 +250,8 @@ swarm_cleanup(force=True)    # archive session to markdown + purge transient fil
 | Tool | Description |
 |---|---|
 | `swarm_status(agent_id?)` | Worker status, model, progress, cost |
-| `swarm_logs(agent_id)` | Read worker tmux output |
 | `swarm_dashboard()` | Full swarm state in one call |
+| `swarm_dashboard_pane()` | Live tmux dashboard pane |
 | `swarm_health()` | Stale detection and health summary |
 
 ### Wait & Results
@@ -269,7 +267,7 @@ swarm_cleanup(force=True)    # archive session to markdown + purge transient fil
 | Tool | Description |
 |---|---|
 | `swarm_decompose(task)` | Auto-split complex task into sub-tasks |
-| `swarm_execute(plan)` | Spawn all workers from an approved plan |
+| `swarm_execute(plan_name, subtasks, provider)` | Spawn all workers from an approved plan |
 | `swarm_workflow(name, autonomous=False)` | Named workflow planning/execution wrapper |
 
 ### Analysis
@@ -279,7 +277,7 @@ swarm_cleanup(force=True)    # archive session to markdown + purge transient fil
 | `swarm_stats()` | Historical performance per model and task category |
 | `swarm_report()` | Performance report with model recommendations |
 | `swarm_costs()` | Running cost totals and budget status |
-| `swarm_record_cost(amount, model, tokens?)` | Manually record a cost entry |
+| `swarm_record_cost(agent_id, amount, input_tokens, output_tokens)` | Manually record a cost entry |
 
 ### Recovery
 
@@ -295,7 +293,7 @@ swarm_cleanup(force=True)    # archive session to markdown + purge transient fil
 | Tool | Description |
 |---|---|
 | `swarm_whoami()` | Self-identification (role, workspace) |
-| `swarm_ask_permission(paths)` | Worker requests file access; Main approves/denies |
+| `swarm_ask_permission(agent_id, path, reason, action)` | Worker requests file access; Main approves/denies |
 | `swarm_request_peer(agent_id, task)` | Worker requests a peer for a sub-task |
 | `swarm_cleanup(force=False)` | Manual archival and purge trigger |
 
@@ -322,7 +320,7 @@ swarm_spawn(agent_id="worker-1", provider="opencode", task="...")
 
 ### Concurrency model
 
-- Each provider has a configurable concurrency cap (default: 3 for OpenCode, 2 for Claude Code, 2 for Codex)
+- Each provider has a configurable concurrency cap (default: 5 for OpenCode, 3 for Claude Code, 3 for Codex)
 - Workers exceeding the cap are queued as `PENDING`
 - `swarm_dispatch_queue()` auto-launches queued workers when slots free up
 - `swarm_dashboard()` exposes queue depth by provider
@@ -332,12 +330,12 @@ swarm_spawn(agent_id="worker-1", provider="opencode", task="...")
 | Scenario | Detection | Recovery |
 |---|---|---|
 | Worker stale (rate limited) | Output frozen + pattern match | Smart retry suggests provider switch |
-| Worker exceeds `max_duration` | Timer expiry | Auto-terminate and alert Main |
-| Worker starved in queue | Queue time > threshold | Auto-bump priority + notify Main |
+| Worker exceeds `max_lifetime` | Not monitored | Stored for reference only |
+| Worker starved in queue | Queue time > threshold | Notify Main (priority bump not yet implemented) |
 | Main Brain crashes | Heartbeat stale | Workers self-terminate via TTL |
 | Two Main sessions | Lock file collision | Second MAIN warned, runs standalone |
-| Duplicate task | Hash match | Block and offer cached result |
-| Budget exceeded | Cost counter > `budget_limit` | Worker self-terminates |
+| Duplicate task | Normalized text match | Block if active or similar task running |
+| Budget exceeded | Cost counter >= `budget_limit` | Main-side kill on next cost record |
 
 ---
 
@@ -393,7 +391,7 @@ Tests use a mock tmux manager. To validate end-to-end behavior without a real tm
 python3 -m pytest tests/ -v
 ```
 
-All 30 tests pass in mock mode. Real tmux integration requires `tmux` installed on the system.
+All 69 tests pass in mock mode. Real tmux integration requires `tmux` installed on the system.
 
 ---
 
@@ -427,7 +425,7 @@ src/swarm_mcp/
 
 Items marked **done** are implemented and tested. The rest are hardening opportunities.
 
-- [x] FastMCP stdio server with 28 tools
+- [x] FastMCP stdio server with 33 tools
 - [x] Multi-provider worker spawn (OpenCode, Claude Code, Codex)
 - [x] Worker registry with persistent state
 - [x] Tmux session management with mock mode
@@ -441,10 +439,20 @@ Items marked **done** are implemented and tested. The rest are hardening opportu
 - [x] Live dashboard (text + JSON)
 - [x] Performance stats and model recommendations
 - [x] Trusted workflow engine with graduated trust
-- [ ] Semantic task similarity for deduplication
-- [ ] Provider-native token/cost ingestion
-- [ ] Live tmux dashboard pane renderer loop
-- [ ] Non-interactive permission denial parser pipeline
+- [x] Semantic task similarity for deduplication
+- [x] Provider-native token/cost ingestion
+- [x] Live tmux dashboard pane renderer loop
+- [x] Non-interactive permission denial parser pipeline
+
+### Known Limitations
+
+- **Permission monitoring is post-hoc, not preventive.** Providers are launched with `--dangerously-skip-permissions` / `bypassPermissions` flags for compatibility. The permission parser detects and logs denied paths from output, but cannot block access at the provider level. Remove bypass flags in `config.py` and `provider_router.py` to enforce strict permission boundaries.
+
+- **Queue dispatch is not transactional.** When a queued worker is about to launch, it is removed from the pending queue before the tmux spawn. If the spawn fails, the task is lost — it is not re-queued. This is a simplification to avoid unbounded retry loops.
+
+- **Duplicate `agent_id` has a race window.** The pre-spawn check for duplicate agent IDs is not atomic with the tmux launch. Two concurrent `swarm_spawn` calls with the same `agent_id` could both pass the check before either writes to the registry. This is unlikely in practice (MCP handles requests sequentially) but not guaranteed under all transports.
+
+- **Cost recording is additive and not concurrency-safe.** Budget spent is computed as `record.status.budget_spent + amount` without file-level locking. In the current single-threaded async model this is safe, but concurrent MCP transports or multi-process access to the registry file could produce incorrect totals. The `parsed_cost` guard in `_process_result_file` prevents double-counting from repeated collect calls.
 
 ---
 

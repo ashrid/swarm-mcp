@@ -105,7 +105,13 @@ class WorkspaceManager:
 
     def read_main_lock(self) -> dict[str, object] | None:
         path = self.lock_file()
-        if not path.exists() or not path.read_text(encoding="utf-8").strip():
+        if not path.exists():
+            return None
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        if not text:
             return None
         payload = self.read_json(path, {})
         return payload if isinstance(payload, dict) else None
@@ -133,5 +139,5 @@ class WorkspaceManager:
             return default
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except JSONDecodeError:
+        except (JSONDecodeError, OSError, UnicodeDecodeError):
             return default

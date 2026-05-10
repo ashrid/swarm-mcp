@@ -54,6 +54,14 @@ class MockTmuxManager:
             for agent_id, pane in self._panes.items()
         }
 
+    def spawn_dashboard(self, swarm_dir: str, refresh_interval: int = 5) -> str:
+        pane_id = f"{self.session_name}:swarm-dashboard"
+        self._panes["swarm-dashboard"] = MockPane(
+            command=f"dashboard {swarm_dir} {refresh_interval}",
+            content=[f"Dashboard rendering every {refresh_interval}s"],
+        )
+        return pane_id
+
     def cleanup_all(self) -> None:
         for pane in self._panes.values():
             pane.alive = False
@@ -152,6 +160,26 @@ class TmuxManager:
                 if title:
                     workers[str(title)] = str(pane.pane_id)
         return workers
+
+    def spawn_dashboard(self, swarm_dir: str, refresh_interval: int = 5) -> str:
+        import shlex
+
+        if self.mock:
+            assert self._mock_impl is not None
+            return self._mock_impl.spawn_dashboard(swarm_dir, refresh_interval)
+        session = self._ensure_session()
+        window = session.attached_window or session.windows[0]
+        pane = window.attached_pane or window.panes[0]
+        if window.panes:
+            pane = pane.split(attach=False)
+        pane.cmd("select-pane", "-T", "swarm-dashboard")
+        clamped_refresh = max(1, min(refresh_interval, 60))
+        env = f"SWARM_DASHBOARD_REFRESH={clamped_refresh}"
+        command = (
+            f"{env} python3 -m swarm_mcp.dashboard_renderer {shlex.quote(swarm_dir)}"
+        )
+        pane.send_keys(command, enter=True, literal=True)
+        return str(pane.pane_id)
 
     def cleanup_all(self) -> None:
         if self.mock:

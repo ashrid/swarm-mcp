@@ -7,16 +7,39 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from .types import JsonModel, ProviderConfig, ProviderKind
 
 
 class BudgetConfig(JsonModel):
-    default_task_budget: float = 5.0
+    default_task_budget: float = Field(default=5.0, ge=0)
     max_cost_per_provider: dict[str, float] = Field(
         default_factory=lambda: {"opencode": 50.0, "claude_code": 50.0, "codex": 50.0}
     )
+
+    @field_validator("default_task_budget")
+    @classmethod
+    def _validate_default_budget(cls, v: float) -> float:
+        import math
+
+        if not math.isfinite(v):
+            raise ValueError("default_task_budget must be a finite number")
+        return v
+
+    @field_validator("max_cost_per_provider")
+    @classmethod
+    def _validate_provider_costs(cls, v: dict[str, float]) -> dict[str, float]:
+        import math
+
+        for provider, cost in v.items():
+            if not isinstance(cost, (int, float)) or isinstance(cost, bool):
+                raise ValueError(f"max_cost_per_provider[{provider}] must be a number")
+            if not math.isfinite(cost) or cost < 0:
+                raise ValueError(
+                    f"max_cost_per_provider[{provider}] must be a non-negative finite number"
+                )
+        return v
 
 
 class ThresholdConfig(JsonModel):
@@ -36,7 +59,6 @@ class PermissionMonitorConfig(JsonModel):
         default_factory=lambda: [
             r"Denied\s+external_directory:\s+(?P<path>\S+)",
             r"Denied\s+read:\s+(?P<path>\S+)",
-            r"To allow, add to opencode\.json",
         ]
     )
 

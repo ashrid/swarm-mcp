@@ -254,3 +254,41 @@ def test_worker_runner_context_and_result_dispatch(tmp_path: Path) -> None:
         assert loaded_second.status.state == WorkerState.RUNNING
 
     asyncio.run(run())
+
+
+def test_process_result_file_marks_failed_when_budget_exceeded(tmp_path: Path) -> None:
+    async def run() -> None:
+        app = await build_app_context(tmp_path)
+        status = WorkerStatus(
+            agent_id="worker-1",
+            task_id="task-1",
+            provider=ProviderKind.OPENCODE,
+            state=WorkerState.RUNNING,
+            role=Role.WORKER,
+            priority=Priority.NORMAL,
+            budget_spent=5.0,
+        )
+        task = WorkerTask(
+            agent_id="worker-1",
+            provider=ProviderKind.OPENCODE,
+            prompt="analyze auth",
+            budget_limit=5.0,
+        )
+        await app.registry.register(status, task)
+        app.workspace.write_json(
+            app.workspace.result_file("worker-1"),
+            {
+                "task_id": "task-1",
+                "agent_id": "worker-1",
+                "output": "Done. Cost: $0.01",
+                "exit_code": 0,
+            },
+        )
+        payload = await _process_result_file(app, "worker-1")
+        assert payload is not None
+        assert payload.get("failure_class") == "budget_exceeded"
+        assert payload.get("exit_code") == 1
+        loaded = await app.registry.get("worker-1")
+        assert loaded.status.state == WorkerState.FAILED
+
+    asyncio.run(run())

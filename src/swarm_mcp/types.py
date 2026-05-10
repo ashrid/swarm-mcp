@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def utc_now_iso() -> str:
@@ -43,6 +43,7 @@ class FailureClass(str, Enum):
     STALE = "stale"
     TASK_TOO_COMPLEX = "task_too_complex"
     CONTEXT_OVERFLOW = "context_overflow"
+    BUDGET_EXCEEDED = "budget_exceeded"
     UNKNOWN = "unknown"
 
 
@@ -62,8 +63,15 @@ class ProviderConfig(JsonModel):
     base_args: list[str] = Field(default_factory=list)
     default_model: str | None = None
     max_workers: int = 5
-    cost_per_1k_input: float = 0.0
-    cost_per_1k_output: float = 0.0
+    cost_per_1k_input: float = Field(default=0.0, ge=0, le=1e6)
+    cost_per_1k_output: float = Field(default=0.0, ge=0, le=1e6)
+
+    @field_validator("cost_per_1k_input", "cost_per_1k_output", mode="before")
+    @classmethod
+    def _reject_bool_cost(cls, v: Any) -> Any:
+        if isinstance(v, bool):
+            raise ValueError("cost rate must be a number, not a boolean")
+        return v
 
 
 class Heartbeat(JsonModel):
@@ -83,9 +91,9 @@ class CostEntry(JsonModel):
     agent_id: str
     model: str
     provider: ProviderKind
-    input_tokens: int = 0
-    output_tokens: int = 0
-    estimated_cost: float = 0.0
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    estimated_cost: float = Field(default=0.0, ge=0)
     timestamp: str = Field(default_factory=utc_now_iso)
 
 
